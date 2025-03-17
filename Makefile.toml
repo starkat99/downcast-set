@@ -43,4 +43,16 @@ args = [
 
 # Add doc lints to CI flow
 [tasks.post-ci-flow]
-run_task = "check-docs"
+run_task = [{ name = ["check-docs", "build-no-sync", "test-no-sync"] }]
+
+[tasks.build-no-sync]
+description = "Build without sync feature"
+category = "Build"
+env = { CARGO_MAKE_CARGO_BUILD_TEST_FLAGS = "--no-default-features" }
+run_task = "build"
+
+[tasks.test-no-sync]
+description = "Run tests without sync feature"
+category = "Test"
+env = { CARGO_MAKE_CARGO_BUILD_TEST_FLAGS = "--no-default-features" }
+run_task = "test"
