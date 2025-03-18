@@ -6,7 +6,84 @@ use std::{
     iter::FusedIterator,
 };
 
-#[derive(Clone, Debug, Default)]
+pub trait Upcast<T>: Downcast
+where
+    T: ?Sized + Any,
+{
+    fn upcast(self) -> Box<T>;
+}
+
+pub trait UncheckedDowncast<T>: Any
+where
+    T: Downcast,
+{
+    unsafe fn downcast_ref_unchecked(&self) -> &T;
+
+    unsafe fn downcast_mut_unchecked(&mut self) -> &mut T;
+
+    unsafe fn downcast_unchecked(self: Box<Self>) -> Box<T>;
+}
+
+impl<T> Upcast<dyn Any> for T
+where
+    T: Any,
+{
+    fn upcast(self) -> Box<dyn Any> {
+        Box::new(self)
+    }
+}
+
+impl<T> UncheckedDowncast<T> for dyn Any
+where
+    T: Any,
+{
+    // TODO replace unwrap_unchecked when *_unchecked versions are stabilized
+    unsafe fn downcast_ref_unchecked(&self) -> &T {
+        self.downcast_ref().unwrap()
+    }
+
+    unsafe fn downcast_mut_unchecked(&mut self) -> &mut T {
+        self.downcast_mut().unwrap()
+    }
+
+    unsafe fn downcast_unchecked(self: Box<Self>) -> Box<T> {
+        self.downcast().unwrap()
+    }
+}
+
+#[macro_export]
+macro_rules! impl_casts {
+    ($trait:ident) => {
+        impl<T> $crate::Upcast<dyn $trait> for T
+        where
+            T: $trait,
+        {
+            fn upcast(self) -> Box<dyn $trait> {
+                Box::new(self)
+            }
+        }
+
+        impl<T> $crate::UncheckedDowncast<T> for dyn $trait
+        where
+            T: $trait,
+        {
+            // TODO replace unwrap_unchecked when *_unchecked versions are stabilized
+            unsafe fn downcast_ref_unchecked(&self) -> &T {
+                self.as_any().downcast_ref().unwrap()
+            }
+
+            unsafe fn downcast_mut_unchecked(&mut self) -> &mut T {
+                self.as_any_mut().downcast_mut().unwrap()
+            }
+
+            unsafe fn downcast_unchecked(self: Box<Self>) -> Box<T> {
+                self.into_any().downcast().unwrap()
+            }
+        }
+    };
+}
+
+#[derive(Debug, Default)]
 pub struct DowncastSet<D: ?Sized, S = RandomState> {
     map: HashMap<TypeId, Box<D>, S>,
 }
@@ -108,43 +185,72 @@ where
 
 impl<D, S> DowncastSet<D, S>
 where
-    D: ?Sized + Downcast,
+    D: ?Sized + Any,
     S: BuildHasher,
 {
-    pub fn contains<T: Any>(&self) -> bool {
+    pub fn contains<T>(&self) -> bool
+    where
+        T: Upcast<D>,
+        D: UncheckedDowncast<T>,
+    {
         self.map.contains_key(&TypeId::of::<T>())
     }
 
-    pub fn get<T: Downcast>(&self) -> Option<&T> {
+    pub fn get<T>(&self) -> Option<&T>
+    where
+        T: Upcast<D>,
+        D: UncheckedDowncast<T>,
+    {
         self.map
             .get(&TypeId::of::<T>())
-            .map(|p| unsafe { &*(p.as_ref() as *const D as *const T) })
+            .map(|p| unsafe { p.as_ref().downcast_ref_unchecked() })
     }
 
-    pub fn get_mut<T: Downcast>(&mut self) -> Option<&mut T> {
+    pub fn get_mut<T>(&mut self) -> Option<&mut T>
+    where
+        T: Upcast<D>,
+        D: UncheckedDowncast<T>,
+    {
         self.map
             .get_mut(&TypeId::of::<T>())
-            .map(|p| unsafe { &mut *(p.as_mut() as *mut D as *mut T) })
+            .map(|p| unsafe { p.as_mut().downcast_mut_unchecked() })
     }
 
-    pub fn insert<T: Into<Box<D>> + 'static>(&mut self, value: T) -> bool {
-        self.map.insert(value.type_id(), value.into()).is_some()
+    pub fn insert<T>(&mut self, value: T) -> bool
+    where
+        T: Upcast<D>,
+        D: UncheckedDowncast<T>,
+    {
+        !self.map.contains_key(&value.type_id())
+            && self.map.insert(value.type_id(), value.upcast()).is_none()
     }
 
-    pub fn replace<T: Into<Box<D>> + 'static>(&mut self, value: T) -> Option<T> {
+    pub fn replace<T: Upcast<D>>(&mut self, value: T) -> Option<T>
+    where
+        T: Upcast<D>,
+        D: UncheckedDowncast<T>,
+    {
         self.map
-            .insert(value.type_id(), value.into())
-            .map(|p| *unsafe { Box::from_raw(Box::into_raw(p) as *mut T) })
+            .insert(value.type_id(), value.upcast())
+            .map(|p| *unsafe { p.downcast_unchecked() })
     }
 
-    pub fn remove<T: Downcast>(&mut self) -> bool {
+    pub fn remove<T>(&mut self) -> bool
+    where
+        T: Any,
+        D: UncheckedDowncast<T>,
+    {
         self.map.remove(&TypeId::of::<T>()).is_some()
     }
 
-    pub fn take<T: Downcast>(&mut self) -> Option<T> {
+    pub fn take<T>(&mut self) -> Option<T>
+    where
+        T: Upcast<D>,
+        D: UncheckedDowncast<T>,
+    {
         self.map
             .remove(&TypeId::of::<T>())
-            .map(|p| *unsafe { Box::from_raw(Box::into_raw(p) as *mut T) })
+            .map(|p| *unsafe { p.downcast_unchecked() })
     }
 }
 
@@ -307,3 +413,85 @@ impl<T: ?Sized> ExactSizeIterator for Drain<'_, T> {
 }
 
 impl<T: ?Sized> FusedIterator for Drain<'_, T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    trait TestTrait: Downcast {
+        fn value(&self) -> i32;
+    }
+    impl_casts!(TestTrait);
+
+    // impl<T> Downcast<dyn TestTrait> for T
+    // where
+    //     T: TestTrait + Any,
+    // {
+    //     fn into_dyn_box(self: Box<Self>) -> Box<dyn TestTrait> {
+    //         self
+    //     }
+    // }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct A(i32);
+
+    impl TestTrait for A {
+        fn value(&self) -> i32 {
+            self.0
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct B(i32);
+
+    impl TestTrait for B {
+        fn value(&self) -> i32 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn downcast_set_basics() {
+        let mut set: DowncastSet<dyn TestTrait> = DowncastSet::new();
+
+        assert!(set.is_empty());
+        assert!(set.get::<A>().is_none());
+        assert!(set.get::<B>().is_none());
+
+        assert!(!set.contains::<A>());
+        assert!(set.insert(A(1)));
+        assert!(!set.contains::<B>());
+        assert!(set.insert(B(2)));
+        assert!(!set.insert(B(3)));
+
+        assert_eq!(set.len(), 2);
+        assert!(set.contains::<A>());
+        assert!(set.contains::<B>());
+        assert_eq!(set.get::<A>(), Some(&A(1)));
+        assert_eq!(set.get::<B>(), Some(&B(2)));
+
+        for item in &set {
+            if item.as_any().is::<A>() {
+                assert_eq!(item.value(), 1);
+            } else {
+                assert!(item.as_any().is::<B>());
+                assert_eq!(item.value(), 2);
+            }
+        }
+
+        set.get_mut::<A>().unwrap().0 = 3;
+        assert_eq!(set.get::<A>(), Some(&A(3)));
+
+        assert_eq!(set.replace(B(4)), Some(B(2)));
+        assert_eq!(set.get::<B>(), Some(&B(4)));
+        assert_eq!(set.len(), 2);
+
+        assert!(set.remove::<B>());
+        assert!(!set.remove::<B>());
+        assert!(!set.contains::<B>());
+        assert_eq!(set.len(), 1);
+
+        assert_eq!(set.take::<A>(), Some(A(3)));
+        assert!(set.is_empty());
+    }
+}
